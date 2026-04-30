@@ -9,7 +9,7 @@ Rules:
 - Review config keys against actual usage before adding or renaming settings.
 - Prefer small, explicit changes over broad rewrites in the pipeline.
 - Verify new docs still match the shipped CLI behavior.
-- Pair this file with [`SKILL.md`](/root/dev/c3po-shodan/docs/workflows/maintenance/SKILL.md) for implementation-focused checks.
+- Pair this file with [`SKILL.md`](./SKILL.md) for implementation-focused checks.
 
 Acceptance checks:
 

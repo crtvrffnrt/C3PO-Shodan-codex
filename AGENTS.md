@@ -6,13 +6,13 @@ Mission: orchestrate domain-focused attack-surface discovery with Shodan and Nuc
 
 Use the workflow-specific guidance files for implementation details:
 
-- [`docs/workflows/validation/GEMINI.md`](docs/workflows/validation/GEMINI.md)
+- [`docs/workflows/validation/AGENTS.md`](docs/workflows/validation/AGENTS.md)
 - [`docs/workflows/validation/SKILL.md`](docs/workflows/validation/SKILL.md)
-- [`docs/workflows/collection/GEMINI.md`](docs/workflows/collection/GEMINI.md)
+- [`docs/workflows/collection/AGENTS.md`](docs/workflows/collection/AGENTS.md)
 - [`docs/workflows/collection/SKILL.md`](docs/workflows/collection/SKILL.md)
-- [`docs/workflows/rendering/GEMINI.md`](docs/workflows/rendering/GEMINI.md)
+- [`docs/workflows/rendering/AGENTS.md`](docs/workflows/rendering/AGENTS.md)
 - [`docs/workflows/rendering/SKILL.md`](docs/workflows/rendering/SKILL.md)
-- [`docs/workflows/maintenance/GEMINI.md`](docs/workflows/maintenance/GEMINI.md)
+- [`docs/workflows/maintenance/AGENTS.md`](docs/workflows/maintenance/AGENTS.md)
 - [`docs/workflows/maintenance/SKILL.md`](docs/workflows/maintenance/SKILL.md)
 
 ## Working Rules
@@ -35,4 +35,3 @@ Use the workflow-specific guidance files for implementation details:
 - Avoid reverting user changes or making destructive git operations.
 - Keep new comments concise and only add them when the code is not self-explanatory.
 - Preserve ASCII unless the file already uses another character set or there is a clear need.
-

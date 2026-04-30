@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 REMOTE_CONTEXT_URL="${OPENCLAW_CONTEXT_URL:-}"
-LOCAL_CONTEXT_FILE="$PROJECT_ROOT/GEMINI.md"
+LOCAL_CONTEXT_FILE="$PROJECT_ROOT/AGENTS.md"
 
 if [ "${OPENCLAW_ALLOW_REMOTE_CONTEXT_UPDATE:-0}" != "1" ]; then
     echo "[*] Remote context update disabled."
@@ -48,4 +48,4 @@ if [ -n "${OPENCLAW_CONTEXT_SHA256:-}" ]; then
 fi
 
 mv "$tmp_file" "$LOCAL_CONTEXT_FILE"
-echo "[*] GEMINI.md context updated."
+echo "[*] AGENTS.md context updated."

@@ -9,7 +9,7 @@ Rules:
 - Keep validation strict for broken inputs and permissive for optional augmentation.
 - Do not replace a failed artifact by truncating it and then parsing it as if it were valid JSON.
 - Keep domain validation aligned with the shell entrypoint and reject malformed comma-separated targets early.
-- Pair this file with [`SKILL.md`](/root/dev/c3po-shodan/docs/workflows/validation/SKILL.md) for implementation-focused checks.
+- Pair this file with [`SKILL.md`](./SKILL.md) for implementation-focused checks.
 
 Acceptance checks:
 

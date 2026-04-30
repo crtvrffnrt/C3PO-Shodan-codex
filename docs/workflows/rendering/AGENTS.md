@@ -9,7 +9,7 @@ Rules:
 - Make screenshots optional and render them only when present and valid.
 - Use stable output paths and do not overwrite unrelated site assets.
 - Preserve the current visual language unless a full design change is explicitly planned.
-- Pair this file with [`SKILL.md`](/root/dev/c3po-shodan/docs/workflows/rendering/SKILL.md) for implementation-focused checks.
+- Pair this file with [`SKILL.md`](./SKILL.md) for implementation-focused checks.
 
 Acceptance checks:
 

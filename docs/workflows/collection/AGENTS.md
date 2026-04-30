@@ -10,7 +10,7 @@ Rules:
 - Preserve evidence fields separately from derived scoring fields.
 - Keep IPv4 and IPv6 network hints canonical instead of hand-building fragile CIDR strings.
 - Treat provider-linked takeover signals as heuristics, not hard proof.
-- Pair this file with [`SKILL.md`](/root/dev/c3po-shodan/docs/workflows/collection/SKILL.md) for implementation-focused checks.
+- Pair this file with [`SKILL.md`](./SKILL.md) for implementation-focused checks.
 
 Acceptance checks:
 
