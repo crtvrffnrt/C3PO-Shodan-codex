@@ -17,6 +17,7 @@ attack_surface_latest.html
 *.svg
 *.md
 !README.md
+!AGENTS.md
 !docs/*.md
 !prompts/README.md
 !GEMINI.md
