@@ -22,7 +22,6 @@ attack_surface_latest.html
 !docs/workflows/**/AGENTS.md
 !docs/workflows/**/SKILL.md
 !prompts/README.md
-!GEMINI.md
 
 # Logs and runtime data
 runtime/*

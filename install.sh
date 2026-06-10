@@ -108,13 +108,5 @@ else
     echo -e "${GREEN}[+] Cloudflare credentials found. Cloudflare URL Scanner will be used as the primary screenshot source.${NC}"
 fi
 
-# 7. Check for Gemini CLI authentication
-echo -e "${GREEN}[*] Checking Gemini CLI authentication...${NC}"
-if ! gemini -p "ping" -o text >/dev/null 2>&1; then
-    echo -e "${RED}[!] Gemini CLI is not authenticated or not installed correctly.${NC}"
-    echo -e "${YELLOW}[i] Please run 'gemini login' manually if you haven't yet.${NC}"
-    # We don't exit here because the user might have configured it differently, but we warn.
-fi
-
 echo -e "${GREEN}[+] Prerequisites check complete.${NC}"
 exit 0

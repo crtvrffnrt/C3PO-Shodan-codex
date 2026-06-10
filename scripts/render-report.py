@@ -7,6 +7,7 @@ import sys
 from datetime import datetime
 from html import escape
 from typing import Optional
+from urllib.parse import urlparse
 
 RISKY_PORTS = {
     21: "FTP: Cleartext authentication and data transfer. High risk of credential sniffing and unauthorized file access.",
@@ -91,6 +92,41 @@ def severity_class(level: str) -> str:
         "medium": "medium",
         "low": "low",
     }.get((level or "").lower(), "low")
+
+
+def target_host(value: str) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.hostname:
+        return parsed.hostname.lower().rstrip(".")
+    return value.split("/", 1)[0].split(":", 1)[0].lower().rstrip(".")
+
+
+def attach_nuclei_findings(hosts: list[dict], nuclei_results: list[dict]) -> list[dict]:
+    by_name = {}
+    by_ip = {}
+    for host in hosts:
+        host_copy = dict(host)
+        host_copy["nuclei_findings"] = []
+        hostname = str(host_copy.get("hostname", "")).lower().rstrip(".")
+        if hostname:
+            by_name[hostname] = host_copy
+        for ip in host_copy.get("current_ips", []) or []:
+            by_ip[str(ip)] = host_copy
+
+    for result in nuclei_results:
+        matched = target_host(result.get("matched-at", "") or result.get("host", ""))
+        host = by_name.get(matched) or by_ip.get(matched)
+        if not host:
+            for candidate_name, candidate in by_name.items():
+                if matched == candidate_name or matched.endswith(f".{candidate_name}"):
+                    host = candidate
+                    break
+        if host is not None:
+            host["nuclei_findings"].append(result)
+
+    return list(by_name.values())
 
 
 def risk_label(score: int, level: str) -> str:
@@ -307,6 +343,11 @@ def render_host_card(host: dict, screenshot_entry: Optional[dict], card_index: i
         f'<span class="pill vuln" title="{escape(host.get("vuln_details", {}).get(v, {}).get("summary", "No details available."))}\nCVSS: {host.get("vuln_details", {}).get(v, {}).get("cvss", "n/a")}">{escape(str(v))}</span>'
         for v in host.get("vulns", [])[:12]
     )
+    nuclei_findings = host.get("nuclei_findings", []) or []
+    nuclei_pills = "".join(
+        f'<span class="pill vuln" title="{escape(item.get("info", {}).get("name", ""))}">{escape(item.get("template-id", "nuclei"))}</span>'
+        for item in nuclei_findings[:12]
+    )
 
     factors = "".join(f"<li>{escape(factor)}</li>" for factor in host.get("risk_factors", [])[:5])
     ips = host.get("current_ips", [])
@@ -348,6 +389,9 @@ def render_host_card(host: dict, screenshot_entry: Optional[dict], card_index: i
         <div class="section-label">Known Vulnerabilities</div>
         <div class="vuln-grid">{vulns or '<span class="muted small">No CVEs recorded for this host.</span>'}</div>
 
+        <div class="section-label">Nuclei Detections</div>
+        <div class="vuln-grid">{nuclei_pills or '<span class="muted small">No template matches recorded for this host.</span>'}</div>
+
         <div class="risk-factors">
           <span class="section-label">Risk Factors</span>
           <ul>{factors or '<li>Baseline exposure observed.</li>'}</ul>
@@ -368,7 +412,7 @@ def render_host_card(host: dict, screenshot_entry: Optional[dict], card_index: i
 def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> str:
     target = payload.get("target", {})
     summary = payload.get("summary", {})
-    hosts = payload.get("hosts", [])
+    hosts = attach_nuclei_findings(payload.get("hosts", []), nuclei_results)
     ip_assets = payload.get("ips", [])
     discoveries = payload.get("discoveries", {})
     screenshots = screenshot_map(manifest)
@@ -402,6 +446,7 @@ def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> st
     nuclei_critical = sum(1 for r in nuclei_results if r.get("info", {}).get("severity") == "critical")
     nuclei_high = sum(1 for r in nuclei_results if r.get("info", {}).get("severity") == "high")
     nuclei_med = sum(1 for r in nuclei_results if r.get("info", {}).get("severity") == "medium")
+    nuclei_low = sum(1 for r in nuclei_results if r.get("info", {}).get("severity") == "low")
     nuclei_total = len(nuclei_results)
 
     critical_count = int(summary.get("critical_count", 0) or 0)
@@ -440,6 +485,7 @@ def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> st
                         ("Critical", str(nuclei_critical), "risk" if nuclei_critical else "neutral"),
                         ("High", str(nuclei_high), "risk" if nuclei_high else "neutral"),
                         ("Medium", str(nuclei_med), "medium" if nuclei_med else "neutral"),
+                        ("Low", str(nuclei_low), "neutral"),
                     ]
                 ) if nuclei_total else "",
             ),
@@ -464,6 +510,7 @@ def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> st
                 render_metric_card("Critical", str(nuclei_critical), "risk" if nuclei_critical else "neutral"),
                 render_metric_card("High", str(nuclei_high), "risk" if nuclei_high else "neutral"),
                 render_metric_card("Medium", str(nuclei_med), "medium" if nuclei_med else "neutral"),
+                render_metric_card("Low", str(nuclei_low), "neutral"),
                 render_metric_card("Total", str(nuclei_total), summary_tone(nuclei_critical, nuclei_high, nuclei_med)),
             ]
         )
@@ -512,6 +559,7 @@ def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> st
           <td class="mono small">{escape(item.get('network_hint', ''))}</td>
           <td class="small">{escape(join_list(item.get('hostnames', [])))}</td>
           <td class="mono small">{escape(join_list([str(port) for port in item.get('ports', [])]))}</td>
+          <td class="small">{escape(join_list(sorted((item.get('port_sources') or {}).keys())))}</td>
           <td class="small">{escape(join_list(item.get('products', [])))}</td>
           <td class="muted small">{escape(item.get('org', '') or 'n/a')}</td>
         </tr>
@@ -1065,6 +1113,7 @@ def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> st
                     <th>Network</th>
                     <th>Hostnames</th>
                     <th>Ports</th>
+                    <th>Port Sources</th>
                     <th>Products</th>
                     <th>Organization</th>
                   </tr>
@@ -1140,7 +1189,7 @@ def html_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> st
 
 def markdown_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -> str:
     target = payload.get("target", {})
-    hosts = payload.get("hosts", [])
+    hosts = attach_nuclei_findings(payload.get("hosts", []), nuclei_results)
 
     lines = [
         f"# EASM Report: {target.get('core_domain', 'unknown')}",
@@ -1158,6 +1207,12 @@ def markdown_report(payload: dict, manifest: dict, nuclei_results: list[dict]) -
         lines.append(f"- IPs: {', '.join(host.get('current_ips', []))}")
         lines.append(f"- HTTP: {host.get('http', {}).get('url', 'n/a')}")
         lines.append(f"- Ports: {', '.join([str(p) for p in host.get('ports', [])])}")
+        if host.get("nuclei_findings"):
+            lines.append("- Nuclei Detections:")
+            for finding in host["nuclei_findings"][:5]:
+                sev = finding.get("info", {}).get("severity", "unknown")
+                name = finding.get("info", {}).get("name", finding.get("template-id", "nuclei"))
+                lines.append(f"  - {sev.upper()}: {name} ({finding.get('matched-at', '')})")
         if host.get("risk_factors"):
             lines.append("- Risk Factors:")
             for f in host["risk_factors"][:5]:

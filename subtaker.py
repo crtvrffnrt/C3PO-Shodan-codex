@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -12,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -252,6 +255,46 @@ def resolve_httpx_binary() -> str:
     return ""
 
 
+def is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(str(value))
+        return True
+    except Exception:
+        return False
+
+
+def network_hint_for_ip(value: str) -> str:
+    try:
+        ip_obj = ipaddress.ip_address(str(value))
+        prefix = 64 if ip_obj.version == 6 else 24
+        return str(ipaddress.ip_network(f"{ip_obj}/{prefix}", strict=False))
+    except Exception:
+        return ""
+
+
+def dedupe_preserve(items) -> list:
+    seen = set()
+    out = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def resolve_hostname_ips(hostname: str, debug: bool = False) -> tuple[str, list[str]]:
+    ips = set()
+    try:
+        for result in socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP):
+            address = result[4][0]
+            if is_ip_address(address):
+                ips.add(address)
+    except Exception as exc:
+        log_dbg(f"DNS resolution failed for {hostname}: {exc}", debug)
+    return hostname, sorted(ips, key=lambda item: (":" in item, item))
+
+
 HTTPX_STATE = {
     "path": resolve_httpx_binary(),
     "disabled_reason": "",
@@ -309,7 +352,7 @@ def init_output_writer(args):
     return (handle, emit)
 
 
-def probe_http_simple(hostname: str) -> dict:
+def probe_http_simple(hostname: str, timeout: int = 20) -> dict:
     """Simple HTTP/S probe using urllib."""
     for scheme in ("https", "http"):
         url = f"{scheme}://{hostname}"
@@ -318,7 +361,7 @@ def probe_http_simple(hostname: str) -> dict:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             req = urllib.request.Request(url, headers={"User-Agent": "C3PO-shodan/1.0"})
-            with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            with urllib.request.urlopen(req, timeout=max(1, timeout), context=ctx) as resp:
                 status = resp.getcode()
                 content = resp.read(16384).decode("utf-8", errors="replace")
                 title_match = re.search(r"<title[^>]*>(.*?)</title>", content, re.IGNORECASE | re.DOTALL)
@@ -437,13 +480,16 @@ def probe_httpx_stack(target: str, debug: bool, timeout: int = 15) -> dict:
     return result
 
 
-def fetch_subdomains_subfinder(domain: str, debug: bool = False) -> list[str]:
+def fetch_subdomains_subfinder(domain: str, debug: bool = False, timeout: int = 900) -> list[str]:
     """Fetch hostnames using subfinder."""
     log_dbg(f"Running subfinder for {domain}...", debug)
     hosts = set()
+    if not shutil.which("subfinder"):
+        log_dbg("subfinder is not installed; skipping subfinder discovery.", debug)
+        return []
     try:
         cmd = ["subfinder", "-d", domain, "-silent", "-all"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=max(30, timeout))
         if result.returncode == 0 and result.stdout.strip():
             for line in result.stdout.splitlines():
                 host = normalize_domain(line.strip())
@@ -451,16 +497,191 @@ def fetch_subdomains_subfinder(domain: str, debug: bool = False) -> list[str]:
                     hosts.add(host)
             if hosts:
                 log_dbg(f"Found {len(hosts)} unique hosts using subfinder", debug)
+    except subprocess.TimeoutExpired:
+        log_dbg(f"subfinder timed out after {timeout}s", debug)
     except Exception as e:
         log_dbg(f"subfinder error: {e}", debug)
     return sorted(list(hosts))
 
 
+def fetch_subdomains_chaos(domain: str, debug: bool = False, timeout: int = 900) -> list[str]:
+    """Fetch hostnames using ProjectDiscovery chaos-client when configured locally."""
+    log_dbg(f"Running chaos-client for {domain}...", debug)
+    hosts = set()
+    if not shutil.which("chaos-client"):
+        log_dbg("chaos-client is not installed; skipping chaos discovery.", debug)
+        return []
+
+    commands = [
+        ["chaos-client", "-d", domain, "-silent"],
+        ["chaos-client", "-d", domain],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=max(30, timeout))
+        except subprocess.TimeoutExpired:
+            log_dbg(f"{' '.join(cmd)} timed out after {timeout}s", debug)
+            continue
+        except Exception as exc:
+            log_dbg(f"chaos-client error: {exc}", debug)
+            continue
+        if result.returncode != 0 and not result.stdout.strip():
+            log_dbg(f"chaos-client returned {result.returncode}: {(result.stderr or '').strip()}", debug)
+            continue
+        for line in result.stdout.splitlines():
+            host = normalize_domain(line.strip())
+            if host and host.endswith(domain) and "*" not in host:
+                hosts.add(host)
+        break
+
+    if hosts:
+        log_dbg(f"Found {len(hosts)} unique hosts using chaos-client", debug)
+    return sorted(hosts)
+
+
+def fetch_shodan_hostname_search(domain: str, api_key: str, page_limit: int, debug: bool = False) -> tuple[list[dict], dict[str, set[str]]]:
+    """Search Shodan for hostname:*.domain and return DNS-like records plus source hints."""
+    records = []
+    source_hosts: dict[str, set[str]] = defaultdict(set)
+    seen_records = set()
+    query = urllib.parse.quote(f"hostname:*.{domain}")
+    for page in range(1, max(page_limit, 0) + 1):
+        url = f"https://api.shodan.io/shodan/host/search?key={api_key}&query={query}&page={page}"
+        body, status, _ = shodan_get(url, debug)
+        if status != 200 or not body:
+            continue
+        try:
+            payload = json.loads(body)
+        except Exception:
+            continue
+        matches = payload.get("matches", []) or []
+        if not matches and page > 1:
+            break
+        for match in matches:
+            ip = str(match.get("ip_str") or "").strip()
+            host_candidates = set()
+            for value in match.get("hostnames", []) or []:
+                host = normalize_domain(value)
+                if host and host.endswith(domain) and "*" not in host:
+                    host_candidates.add(host)
+            for value in match.get("domains", []) or []:
+                host = normalize_domain(value)
+                if host and host.endswith(domain) and "*" not in host:
+                    host_candidates.add(host)
+            ssl_names = match.get("ssl", {}).get("cert", {}).get("subject", {})
+            cn = normalize_domain(ssl_names.get("CN", "") if isinstance(ssl_names, dict) else "")
+            if cn and cn.endswith(domain) and "*" not in cn:
+                host_candidates.add(cn)
+
+            for host in host_candidates:
+                source_hosts[host].add("shodan_search")
+                if ip and is_ip_address(ip):
+                    key = (host, "AAAA" if ":" in ip else "A", ip, "shodan_search")
+                    if key not in seen_records:
+                        seen_records.add(key)
+                        records.append({
+                            "hostname": host,
+                            "type": "AAAA" if ":" in ip else "A",
+                            "value": ip,
+                            "last_seen": str(match.get("timestamp") or ""),
+                            "source": "shodan_search",
+                        })
+        if len(matches) < 100:
+            break
+    return records, source_hosts
+
+
+def scan_nmap_ports(ip: str, top_ports: str, timing: str, timeout: int, debug: bool = False) -> dict:
+    result = {"ip": ip, "ports": [], "products": [], "services": {}, "status": "skipped", "reason": ""}
+    if not shutil.which("nmap"):
+        result["reason"] = "nmap is not installed."
+        return result
+    cmd = ["nmap", "-Pn", f"-{timing}", "--top-ports", str(top_ports), "-oX", "-", ip]
+    log_dbg(f"Running nmap port discovery for {ip}", debug)
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=max(30, timeout))
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+        result["reason"] = f"nmap timed out after {timeout}s."
+        return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["reason"] = str(exc)
+        return result
+
+    if completed.returncode not in (0, 1) or not completed.stdout.strip():
+        result["status"] = "error"
+        result["reason"] = (completed.stderr or f"nmap exited with status {completed.returncode}").strip()
+        return result
+
+    try:
+        root = ET.fromstring(completed.stdout)
+    except Exception as exc:
+        result["status"] = "error"
+        result["reason"] = f"Unable to parse nmap XML: {exc}"
+        return result
+
+    ports = set()
+    products = set()
+    services = {}
+    for port_node in root.findall(".//port"):
+        state_node = port_node.find("state")
+        if state_node is None or state_node.get("state") != "open":
+            continue
+        try:
+            port_id = int(port_node.get("portid", "0"))
+        except Exception:
+            continue
+        if not port_id:
+            continue
+        ports.add(port_id)
+        service_node = port_node.find("service")
+        if service_node is not None:
+            service_name = service_node.get("name", "")
+            product = " ".join(
+                item for item in [
+                    service_node.get("product", ""),
+                    service_node.get("version", ""),
+                ]
+                if item
+            ).strip()
+            if product:
+                products.add(product)
+            services[str(port_id)] = {
+                "name": service_name,
+                "product": product,
+            }
+
+    result.update({
+        "ports": sorted(ports),
+        "products": sorted(products)[:20],
+        "services": services,
+        "status": "ok",
+        "reason": "",
+    })
+    return result
+
+
 def run_domain_shodan_checks(
     domain: str,
     provider_fragments: str,
-    dns_page_limit: int = 4,
-    host_enrichment_limit: int = 30,
+    dns_page_limit: int = 12,
+    host_enrichment_limit: int = 100,
+    web_probe_timeout: int = 20,
+    max_hosts_for_http_probe: int = 250,
+    report_host_limit: int = 250,
+    dns_resolve_limit: int = 500,
+    subfinder_timeout: int = 900,
+    chaos_enabled: bool = True,
+    chaos_timeout: int = 900,
+    shodan_search_enabled: bool = True,
+    shodan_search_page_limit: int = 5,
+    nmap_enabled: bool = True,
+    nmap_target_limit: int = 100,
+    nmap_top_ports: str = "1000",
+    nmap_timeout: int = 900,
+    nmap_timing: str = "T3",
+    nmap_concurrency: int = 4,
     debug: bool = False,
 ) -> dict:
     target_domain = core_domain(normalize_domain(domain))
@@ -478,12 +699,35 @@ def run_domain_shodan_checks(
     hostname_sources = defaultdict(set)
     hostname_sources[target_domain].add("target")
 
-    log_dbg(f"Discovering subdomains for {target_domain}...", debug)
-    extra_hosts = fetch_subdomains_subfinder(target_domain, debug=debug)
+    log_dbg(f"Discovering subdomains for {target_domain} with subfinder...", debug)
+    extra_hosts = fetch_subdomains_subfinder(target_domain, debug=debug, timeout=subfinder_timeout)
     for host in extra_hosts:
         hostname_sources[host].add("subfinder")
+    if chaos_enabled:
+        log_dbg(f"Discovering subdomains for {target_domain} with chaos-client...", debug)
+        for host in fetch_subdomains_chaos(target_domain, debug=debug, timeout=chaos_timeout):
+            hostname_sources[host].add("chaos")
 
     dns_records = []
+    dns_record_keys = set()
+
+    def add_dns_record(hostname: str, rec_type: str, value: str, source: str, last_seen: str = "") -> None:
+        hostname = normalize_domain(hostname)
+        value = str(value or "").strip().rstrip(".")
+        if not hostname or not value:
+            return
+        key = (hostname, rec_type, value, source)
+        if key in dns_record_keys:
+            return
+        dns_record_keys.add(key)
+        dns_records.append({
+            "hostname": hostname,
+            "type": rec_type,
+            "value": value,
+            "last_seen": str(last_seen or ""),
+            "source": source,
+        })
+
     dns_tasks = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         for mode_label, history_flag in [("current", "false"), ("history", "true")]:
@@ -505,11 +749,7 @@ def run_domain_shodan_checks(
                 fqdn = fqdn.lower().rstrip(".")
                 rec_type = entry.get("type", "UNKNOWN")
                 value = str(entry.get("value") or "").rstrip(".")
-                dns_records.append({
-                    "hostname": fqdn, "type": rec_type, "value": value,
-                    "last_seen": str(entry.get("last_seen") or ""),
-                    "source": f"shodan_dns_{mode_label}"
-                })
+                add_dns_record(fqdn, rec_type, value, f"shodan_dns_{mode_label}", str(entry.get("last_seen") or ""))
                 hostname_sources[fqdn].add(f"shodan_dns_{mode_label}")
                 val_norm = normalize_domain(value)
                 if val_norm.endswith(target_domain):
@@ -518,9 +758,34 @@ def run_domain_shodan_checks(
                 fqdn = f"{sub}.{target_domain}".lower().rstrip(".")
                 hostname_sources[fqdn].add(f"shodan_dns_{mode_label}")
 
+    if shodan_search_enabled:
+        log_dbg(f"Searching Shodan for hostname:*.{target_domain}...", debug)
+        search_records, search_sources = fetch_shodan_hostname_search(
+            target_domain,
+            api_key,
+            shodan_search_page_limit,
+            debug=debug,
+        )
+        for rec in search_records:
+            add_dns_record(rec["hostname"], rec["type"], rec["value"], rec["source"], rec.get("last_seen", ""))
+        for host, sources in search_sources.items():
+            hostname_sources[host].update(sources)
+
+    resolve_targets = sorted(hostname_sources.keys())[:max(dns_resolve_limit, 0)]
+    if resolve_targets:
+        log_dbg(f"Resolving {len(resolve_targets)} hostnames via local DNS...", debug)
+    with ThreadPoolExecutor(max_workers=24) as executor:
+        resolve_tasks = [executor.submit(resolve_hostname_ips, host, debug) for host in resolve_targets]
+        for future in as_completed(resolve_tasks):
+            host, ips = future.result()
+            for ip in ips:
+                rec_type = "AAAA" if ":" in ip else "A"
+                add_dns_record(host, rec_type, ip, "local_dns")
+                hostname_sources[host].add("local_dns")
+
     unique_ips = set()
     for rec in dns_records:
-        if rec["type"] in ("A", "AAAA"):
+        if rec["type"] in ("A", "AAAA") and is_ip_address(rec["value"]):
             unique_ips.add(rec["value"])
     
     enrichment_targets = sorted(list(unique_ips))[:host_enrichment_limit]
@@ -578,8 +843,9 @@ def run_domain_shodan_checks(
                     "domains": data.get("domains", []),
                     "hostnames": data.get("hostnames", []),
                     "os": data.get("os", ""),
-                    "network_hint": f"{ip.rsplit('.', 1)[0]}.0/24" if ":" not in ip else f"{ip.rsplit(':', 1)[0]}:/64",
+                    "network_hint": network_hint_for_ip(ip),
                     "shodan_http": shodan_http_info,
+                    "port_sources": {"shodan": ports} if ports else {},
                 }
                 ip_assets.append(ip_obj)
                 ip_summaries[ip] = ip_obj
@@ -594,6 +860,51 @@ def run_domain_shodan_checks(
                     if d_norm.endswith(target_domain):
                         hostname_sources[d_norm].add("shodan_host")
 
+    nmap_results = {}
+    if nmap_enabled:
+        nmap_targets = sorted(list(unique_ips))[:max(nmap_target_limit, 0)]
+        if nmap_targets:
+            log_dbg(f"Running nmap on {len(nmap_targets)} IPs...", debug)
+        with ThreadPoolExecutor(max_workers=max(1, nmap_concurrency)) as executor:
+            nmap_tasks = {
+                executor.submit(scan_nmap_ports, ip, nmap_top_ports, nmap_timing, nmap_timeout, debug): ip
+                for ip in nmap_targets
+            }
+            for future in as_completed(nmap_tasks):
+                ip = nmap_tasks[future]
+                nmap_results[ip] = future.result()
+
+        for ip, scan in nmap_results.items():
+            if scan.get("status") != "ok":
+                continue
+            if ip not in ip_summaries:
+                ip_summaries[ip] = {
+                    "ip": ip,
+                    "ports": [],
+                    "products": [],
+                    "vulns": [],
+                    "vuln_details": {},
+                    "org": "",
+                    "isp": "",
+                    "asn": "",
+                    "country": "",
+                    "city": "n/a",
+                    "domains": [],
+                    "hostnames": [],
+                    "os": "",
+                    "network_hint": network_hint_for_ip(ip),
+                    "shodan_http": {},
+                }
+            summary = ip_summaries[ip]
+            summary["ports"] = sorted(set(summary.get("ports", [])) | set(scan.get("ports", [])))
+            summary["products"] = sorted(set(summary.get("products", [])) | set(scan.get("products", [])))[:20]
+            summary.setdefault("port_sources", {})
+            if scan.get("ports"):
+                summary["port_sources"]["nmap"] = scan.get("ports", [])
+            summary["nmap_services"] = scan.get("services", {})
+
+        ip_assets = sorted(ip_summaries.values(), key=lambda item: item.get("ip", ""))
+
     fragments = []
     if os.path.isfile(provider_fragments):
         with open(provider_fragments, "r", encoding="utf-8") as f:
@@ -604,7 +915,10 @@ def run_domain_shodan_checks(
     all_hostnames = sorted(hostname_sources.keys())
     http_results = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
-        probe_tasks = {executor.submit(probe_http_simple, h): h for h in all_hostnames[:150]}
+        probe_tasks = {
+            executor.submit(probe_http_simple, h, web_probe_timeout): h
+            for h in all_hostnames[:max(max_hosts_for_http_probe, 0)]
+        }
         for future in as_completed(probe_tasks):
             h = probe_tasks[future]
             http_results[h] = future.result()
@@ -612,8 +926,8 @@ def run_domain_shodan_checks(
     host_profiles = []
     for host in all_hostnames:
         recs = [r for r in dns_records if r["hostname"] == host]
-        current_ips = [r["value"] for r in recs if r["type"] in ("A", "AAAA")]
-        cnames = [r["value"] for r in recs if r["type"] == "CNAME"]
+        current_ips = dedupe_preserve([r["value"] for r in recs if r["type"] in ("A", "AAAA") and is_ip_address(r["value"])])
+        cnames = dedupe_preserve([r["value"] for r in recs if r["type"] == "CNAME"])
         matches = []
         for cname in cnames:
             cname_norm = normalize_domain(cname)
@@ -686,7 +1000,7 @@ def run_domain_shodan_checks(
                 all_hostnames_from_shodan.update(s.get("hostnames", []))
 
         httpx_target = choose_httpx_target(host, http_info, host_ports)
-        web_intel = probe_httpx_stack(httpx_target, debug=debug, timeout=15)
+        web_intel = probe_httpx_stack(httpx_target, debug=debug, timeout=web_probe_timeout)
 
         host_profiles.append({
             "hostname": host, "risk_score": score, "risk_level": level, "risk_factors": factors,
@@ -702,7 +1016,7 @@ def run_domain_shodan_checks(
 
     host_profiles.sort(key=lambda x: x["risk_score"], reverse=True)
     all_hosts = host_profiles
-    top_hosts = all_hosts[:100]
+    top_hosts = all_hosts[:max(report_host_limit, 0)]
 
     return {
         "target": {
@@ -720,7 +1034,7 @@ def run_domain_shodan_checks(
             "original_total_hosts": len(all_hosts)
         },
         "discoveries": {
-            "dns_records": dns_records[:100],
+            "dns_records": dns_records,
             "takeover_candidates": [h for h in all_hosts if h["provider_matches"] and not h["current_ips"]]
         },
         "hosts": top_hosts, "ips": ip_assets

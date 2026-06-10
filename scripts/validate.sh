@@ -38,6 +38,18 @@ done
 require_command python3
 require_command curl
 
+if config_is_true "$(parse_yaml "chaos_enabled")"; then
+    if ! command -v chaos-client >/dev/null 2>&1; then
+        echo "[*] chaos-client not found. Chaos subdomain discovery will be skipped." >&2
+    fi
+fi
+
+if config_is_true "$(parse_yaml "nmap_enabled")"; then
+    if ! command -v nmap >/dev/null 2>&1; then
+        echo "[*] nmap not found. Local nmap port discovery will be skipped." >&2
+    fi
+fi
+
 if ! resolve_shodan_key >/dev/null 2>&1; then
     echo "[!] Missing Shodan API key. Set SHODANAPI or ~/.shodan/api_key." >&2
     exit 1

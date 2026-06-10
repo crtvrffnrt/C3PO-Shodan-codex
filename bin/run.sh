@@ -11,30 +11,78 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-DEFAULT_GEMINI_MODEL="gemini-3-flash-preview"
-GEMINI_MODEL_OPTIONS=(
-  "gemini-3-flash-preview"
-  "gemini-2.5-flash"
-  "gemini-3.1-pro-preview"
-  "gemini-3.1-flash-lite-preview"
-  "gemini-3.1-flash-live-preview"
-)
-
-# 1. Run installer/check script
-bash "$PROJECT_ROOT/install.sh"
+DEFAULT_CODEX_MODEL="${DEFAULT_CODEX_MODEL:-gpt-5.5}"
+DEFAULT_CODEX_REASONING_EFFORT="${DEFAULT_CODEX_REASONING_EFFORT:-low}"
+DEFAULT_CODEX_FAST_MODE="${DEFAULT_CODEX_FAST_MODE:-true}"
+CODEX_MODEL_OPTIONS=()
 
 source "$PROJECT_ROOT/scripts/common.sh"
+
+config_or_default() {
+    local key="$1"
+    local fallback="$2"
+    local value
+    value="$(parse_yaml "$key" || true)"
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$fallback"
+    fi
+}
+
+SCREENSHOT_ENABLED="${SCREENSHOT_ENABLED:-$(config_or_default screenshot_enabled true)}"
+MAX_SCREENSHOTS="${MAX_SCREENSHOTS:-$(config_or_default max_screenshots 50)}"
+SCREENSHOT_TIMEOUT_SECONDS="${SCREENSHOT_TIMEOUT_SECONDS:-$(config_or_default screenshot_timeout_seconds 90)}"
+SCREENSHOT_WIDTH="${SCREENSHOT_WIDTH:-$(config_or_default screenshot_window_width 1440)}"
+SCREENSHOT_HEIGHT="${SCREENSHOT_HEIGHT:-$(config_or_default screenshot_window_height 1024)}"
+NUCLEI_ENABLED="${NUCLEI_ENABLED:-$(config_or_default nuclei_enabled true)}"
+NUCLEI_TARGET_LIMIT="${NUCLEI_TARGET_LIMIT:-$(config_or_default nuclei_target_limit 250)}"
+NUCLEI_NETWORK_TARGET_LIMIT="${NUCLEI_NETWORK_TARGET_LIMIT:-$(config_or_default nuclei_network_target_limit 150)}"
+NUCLEI_TAGS="${NUCLEI_TAGS:-$(config_or_default nuclei_tags misconfig,exposure,takeover,cve,tech,default-login,ssl,tls,dns,network)}"
+NUCLEI_SEVERITIES="${NUCLEI_SEVERITIES:-$(config_or_default nuclei_severities critical,high,medium,low)}"
+NUCLEI_CONCURRENCY="${NUCLEI_CONCURRENCY:-$(config_or_default nuclei_concurrency 150)}"
+NUCLEI_BULK_SIZE="${NUCLEI_BULK_SIZE:-$(config_or_default nuclei_bulk_size 25)}"
+NUCLEI_RATE_LIMIT="${NUCLEI_RATE_LIMIT:-$(config_or_default nuclei_rate_limit 200)}"
+NUCLEI_TIMEOUT="${NUCLEI_TIMEOUT:-$(config_or_default nuclei_timeout_seconds 10)}"
+NUCLEI_RETRIES="${NUCLEI_RETRIES:-$(config_or_default nuclei_retries 2)}"
+export NUCLEI_TARGET_LIMIT NUCLEI_NETWORK_TARGET_LIMIT
 
 usage() {
   cat <<EOF
 Usage: $0 [options] [domain]
 
 Orchestrate Shodan attack-surface discovery and EASM reporting.
+Discovery uses Shodan DNS, Shodan hostname search, subfinder, optional
+chaos-client, local DNS resolution, Shodan host enrichment, optional nmap,
+and Nuclei follow-up where targets are available.
 
 Options:
   -d, --domain   Target root domain (supports subdomains like www.example.com)
+  --model MODEL  Set Codex operator model context without prompting
+  --effort LEVEL Set Codex reasoning effort context (low, medium, high)
+  --fast         Mark Codex operator context as fast mode
+  --no-fast      Mark Codex operator context as standard mode
+  --no-model-prompt
+                 Do not show the interactive Codex model menu
   --debug, -Debug, -DEBUG Enable shell tracing and verbose logging
   -h, --help     Show this help
+
+Codex model context:
+  The scanner itself is deterministic bash/Python and does not invoke Codex.
+  In an interactive terminal, run.sh prompts for operator context unless
+  C3PO_CODEX_MODEL, CODEX_MODEL, --model, or --no-model-prompt is set.
+  Built-in menu choices cover:
+    gpt-5.5 low default, medium fast / standard
+    gpt-5.4 low / medium / high
+    gpt-5.4-mini low / medium / high
+
+Useful environment knobs:
+  NUCLEI_TARGET_LIMIT=$NUCLEI_TARGET_LIMIT
+  NUCLEI_NETWORK_TARGET_LIMIT=$NUCLEI_NETWORK_TARGET_LIMIT
+  NUCLEI_TAGS=$NUCLEI_TAGS
+  NUCLEI_SEVERITIES=$NUCLEI_SEVERITIES
+  MAX_SCREENSHOTS=$MAX_SCREENSHOTS
+  nmap/chaos/shodan-search defaults are in config/config.yaml
 EOF
 }
 
@@ -44,8 +92,10 @@ TARGET_INPUT=""
 RELATED_DOMAINS=()
 PHASE_RESULTS=()
 PHASE_INTERRUPT_REQUESTED=0
-
-# ... (omitted regex and validate_domain for brevity in thought, but I must provide full context in replace)
+REQUESTED_CODEX_MODEL=""
+REQUESTED_CODEX_EFFORT=""
+REQUESTED_CODEX_FAST_MODE=""
+MODEL_PROMPT_ENABLED="${C3PO_MODEL_PROMPT:-auto}"
 
 # Regex for domain validation (supports subdomains)
 DOMAIN_REGEX="^([a-zA-Z0-9](([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})$"
@@ -95,63 +145,95 @@ fatal() {
     exit 1
 }
 
-is_supported_gemini_model() {
-    local candidate="${1:-}"
-    local model
-    for model in "${GEMINI_MODEL_OPTIONS[@]}"; do
-        if [ "$candidate" = "$model" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
+configure_codex_context() {
+    if [ -n "$REQUESTED_CODEX_MODEL" ]; then
+        export C3PO_CODEX_MODEL="$REQUESTED_CODEX_MODEL"
+        export CODEX_MODEL="$REQUESTED_CODEX_MODEL"
+    fi
+    if [ -n "$REQUESTED_CODEX_EFFORT" ]; then
+        export C3PO_CODEX_REASONING_EFFORT="$REQUESTED_CODEX_EFFORT"
+    fi
+    if [ -n "$REQUESTED_CODEX_FAST_MODE" ]; then
+        export C3PO_CODEX_FAST_MODE="$REQUESTED_CODEX_FAST_MODE"
+    fi
 
-select_gemini_model() {
-    local current="${C3PO_GEMINI_MODEL:-${GEMINI_MODEL:-}}"
-    local choice=""
-    local selected=""
+    local current="${C3PO_CODEX_MODEL:-${CODEX_MODEL:-}}"
+    if [ -z "$current" ] && [ "$MODEL_PROMPT_ENABLED" != "never" ] && [ "$MODEL_PROMPT_ENABLED" != "false" ] && [ -t 0 ] && [ -t 1 ]; then
+        prompt_codex_context
+        current="${C3PO_CODEX_MODEL:-${CODEX_MODEL:-}}"
+    fi
+    if [ -z "$current" ] && [ -n "${DEFAULT_CODEX_MODEL:-}" ]; then
+        export C3PO_CODEX_MODEL="$DEFAULT_CODEX_MODEL"
+        export CODEX_MODEL="$DEFAULT_CODEX_MODEL"
+        export C3PO_CODEX_REASONING_EFFORT="${C3PO_CODEX_REASONING_EFFORT:-$DEFAULT_CODEX_REASONING_EFFORT}"
+        export C3PO_CODEX_FAST_MODE="${C3PO_CODEX_FAST_MODE:-$DEFAULT_CODEX_FAST_MODE}"
+        current="$DEFAULT_CODEX_MODEL"
+    fi
 
     if [ -n "$current" ]; then
-        if is_supported_gemini_model "$current"; then
-            export C3PO_GEMINI_MODEL="$current"
-            info "Gemini model preset from environment: $C3PO_GEMINI_MODEL"
-            return 0
-        fi
-        warn "Ignoring unsupported Gemini model from environment: $current"
+        export C3PO_CODEX_MODEL="$current"
+        export CODEX_MODEL="$current"
+        info "Codex model context: model=$C3PO_CODEX_MODEL effort=${C3PO_CODEX_REASONING_EFFORT:-unset} fast=${C3PO_CODEX_FAST_MODE:-unset}"
+    else
+        info "Codex operator context enabled; deterministic scanner does not invoke Codex as a subprocess."
     fi
+}
 
-    if [ ! -t 0 ]; then
-        export C3PO_GEMINI_MODEL="$DEFAULT_GEMINI_MODEL"
-        info "Non-interactive shell detected. Using default Gemini model: $C3PO_GEMINI_MODEL"
-        return 0
-    fi
+apply_codex_choice() {
+    local model="$1"
+    local effort="$2"
+    local fast_mode="$3"
+    export C3PO_CODEX_MODEL="$model"
+    export CODEX_MODEL="$model"
+    export C3PO_CODEX_REASONING_EFFORT="$effort"
+    export C3PO_CODEX_FAST_MODE="$fast_mode"
+}
 
+prompt_codex_context() {
+    local choice custom_model custom_effort custom_fast
     echo
-    info "Choose Gemini model for this run:"
-    echo "  1) gemini-3-flash-preview (default)"
-    echo "  2) gemini-2.5-flash"
-    echo "  3) gemini-3.1-pro-preview"
-    echo "  4) gemini-3.1-flash-lite-preview"
-    echo "  5) gemini-3.1-flash-live-preview"
-
-    while true; do
-        printf 'Select model [1-5] (Enter for default): '
-        read -r choice
-        case "${choice:-1}" in
-            1) selected="gemini-3-flash-preview" ;;
-            2) selected="gemini-2.5-flash" ;;
-            3) selected="gemini-3.1-pro-preview" ;;
-            4) selected="gemini-3.1-flash-lite-preview" ;;
-            5) selected="gemini-3.1-flash-live-preview" ;;
-            *)
-                warn "Invalid selection. Choose 1-5."
-                continue
-                ;;
-        esac
-        export C3PO_GEMINI_MODEL="$selected"
-        info "Using Gemini model: $C3PO_GEMINI_MODEL"
-        return 0
-    done
+    info "Choose Codex operator model context (scanner does not invoke Codex):"
+    cat <<'EOF'
+  1) gpt-5.5 | effort low    | fast mode (default)
+  2) gpt-5.5 | effort medium | fast mode
+  3) gpt-5.5 | effort medium | standard mode
+  4) gpt-5.4 | effort high   | standard mode
+  5) gpt-5.4 | effort medium | standard mode
+  6) gpt-5.4 | effort low    | fast mode
+  7) gpt-5.4-mini | effort high   | standard mode
+  8) gpt-5.4-mini | effort medium | fast mode
+  9) gpt-5.4-mini | effort low    | fast mode
+  c) Custom model context
+  0) Continue without model context
+EOF
+    read -r -p "Selection [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+        1) apply_codex_choice "gpt-5.5" "low" "true" ;;
+        2) apply_codex_choice "gpt-5.5" "medium" "true" ;;
+        3) apply_codex_choice "gpt-5.5" "medium" "false" ;;
+        4) apply_codex_choice "gpt-5.4" "high" "false" ;;
+        5) apply_codex_choice "gpt-5.4" "medium" "false" ;;
+        6) apply_codex_choice "gpt-5.4" "low" "true" ;;
+        7) apply_codex_choice "gpt-5.4-mini" "high" "false" ;;
+        8) apply_codex_choice "gpt-5.4-mini" "medium" "true" ;;
+        9) apply_codex_choice "gpt-5.4-mini" "low" "true" ;;
+        c|C)
+            read -r -p "Model name: " custom_model
+            read -r -p "Reasoning effort [medium]: " custom_effort
+            read -r -p "Fast mode? [y/N]: " custom_fast
+            custom_effort="${custom_effort:-medium}"
+            case "$(printf '%s' "$custom_fast" | tr '[:upper:]' '[:lower:]')" in
+                y|yes|true|1) custom_fast="true" ;;
+                *) custom_fast="false" ;;
+            esac
+            if [ -n "$custom_model" ]; then
+                apply_codex_choice "$custom_model" "$custom_effort" "$custom_fast"
+            fi
+            ;;
+        0) DEFAULT_CODEX_MODEL="" ;;
+        *) warn "Unknown model selection '$choice'; continuing without model context." ;;
+    esac
 }
 
 record_phase_result() {
@@ -395,6 +477,27 @@ while [[ $# -gt 0 ]]; do
             TARGET_INPUT="${2:-}"
             shift 2
             ;;
+        --model|--codex-model)
+            REQUESTED_CODEX_MODEL="${2:-}"
+            MODEL_PROMPT_ENABLED="never"
+            shift 2
+            ;;
+        --effort|--reasoning-effort)
+            REQUESTED_CODEX_EFFORT="${2:-}"
+            shift 2
+            ;;
+        --fast)
+            REQUESTED_CODEX_FAST_MODE="true"
+            shift
+            ;;
+        --no-fast)
+            REQUESTED_CODEX_FAST_MODE="false"
+            shift
+            ;;
+        --no-model-prompt)
+            MODEL_PROMPT_ENABLED="never"
+            shift
+            ;;
         --debug|-Debug|-DEBUG)
             DEBUG_MODE=true
             EXTRA_ARGS+=("--debug")
@@ -430,7 +533,9 @@ if ! normalize_target_domain "$TARGET_INPUT"; then
     exit 1
 fi
 
-select_gemini_model
+configure_codex_context
+
+bash "$PROJECT_ROOT/install.sh"
 
 echo -e "${GREEN}[*] Target domain: ${TARGET_DOMAIN}${NC}"
 echo -e "${GREEN}[*] Checking for related domains for report context...${NC}"
@@ -491,13 +596,52 @@ PHASE1_QUIET=true
 if [ "$DEBUG_MODE" = true ]; then
     PHASE1_QUIET=false
 fi
-if ! run_phase_command "phase1" "Phase 1: Running modular discovery/triage pipeline for $TARGET_DOMAIN ..." 35m "$PHASE1_QUIET" "${PIPELINE_CMD[@]}"; then
+if ! run_phase_command "phase1" "Phase 1: Running modular discovery/triage pipeline for $TARGET_DOMAIN ..." 4h "$PHASE1_QUIET" "${PIPELINE_CMD[@]}"; then
     warn "Phase 1 did not complete cleanly; fallback report data will be used where needed."
 fi
 ensure_fallback_payload "$RAW_JSON" "$TARGET_DOMAIN"
 
+DISCOVERY_AUDIT="$OUTPUT_DIR/discovery_audit_${TARGET_SLUG}_${REPORT_DATE}.json"
+if ! run_phase_command "phase1b" "Phase 1b: Auditing discovered host and port coverage ..." 30m false \
+    python3 - "$RAW_JSON" "$DISCOVERY_AUDIT" <<'PY'
+import json
+import sys
+from collections import Counter
+
+raw_json, audit_path = sys.argv[1], sys.argv[2]
+with open(raw_json, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+hosts = payload.get("hosts", [])
+source_counts = Counter()
+unresolved = []
+with_ports = 0
+for host in hosts:
+    for source in host.get("sources", []) or []:
+        source_counts[source] += 1
+    if not host.get("current_ips"):
+        unresolved.append(host.get("hostname", ""))
+    if host.get("ports"):
+        with_ports += 1
+
+audit = {
+    "host_count": len(hosts),
+    "hosts_with_ports": with_ports,
+    "unresolved_host_count": len(unresolved),
+    "unresolved_hosts_sample": unresolved[:100],
+    "source_counts": dict(sorted(source_counts.items())),
+}
+with open(audit_path, "w", encoding="utf-8") as handle:
+    json.dump(audit, handle, indent=2, ensure_ascii=False)
+    handle.write("\n")
+print(json.dumps(audit, indent=2, ensure_ascii=False))
+PY
+then
+    warn "Discovery audit failed; continuing with collected scan data."
+fi
+
 TXT_FINDINGS_JSON="$OUTPUT_DIR/txtfindings_${TARGET_SLUG}_${REPORT_DATE}.json"
-if ! run_phase_command "phase2" "Phase 2: Enriching TXT DNS evidence ..." 35m false \
+if ! run_phase_command "phase2" "Phase 2: Enriching TXT DNS evidence ..." 2h false \
     python3 "$SCRIPTS_DIR/txtfinder.py" --input "$RAW_JSON" --output "$TXT_FINDINGS_JSON"; then
     warn "TXT enrichment did not complete cleanly; continuing with an empty TXT findings file."
     : > "$TXT_FINDINGS_JSON"
@@ -537,6 +681,7 @@ PY
 NUCLEI_TARGETS="$OUTPUT_DIR/targets_${TARGET_SLUG}.txt"
 python3 - "$RAW_JSON" "$NUCLEI_TARGETS" <<'PY'
 import json
+import os
 import sys
 
 raw_json, targets_path = sys.argv[1], sys.argv[2]
@@ -551,13 +696,63 @@ web_hosts = [
 web_hosts.sort(key=lambda item: (-int(item.get("risk_score", 0) or 0), item.get("hostname", "")))
 targets = []
 seen = set()
+
+def add_target(value):
+    if not value or value in seen:
+        return
+    seen.add(value)
+    targets.append(value)
+
 for host in web_hosts:
     url = host["http"]["url"]
-    if url in seen:
-        continue
-    seen.add(url)
-    targets.append(url)
-    if len(targets) == 25:
+    add_target(url)
+    if len(targets) == int(os.environ.get("NUCLEI_TARGET_LIMIT", "250")):
+        break
+
+web_port_schemes = {
+    80: "http", 443: "https", 8000: "http", 8008: "http", 8080: "http",
+    8081: "http", 8443: "https", 9000: "http", 9200: "http",
+}
+network_port_schemes = {
+    21: "ftp", 22: "ssh", 25: "smtp", 53: "dns", 110: "pop3", 143: "imap",
+    389: "ldap", 445: "smb", 465: "smtp", 587: "smtp", 993: "imap",
+    995: "pop3", 1433: "mssql", 1521: "oracle", 3306: "mysql",
+    3389: "rdp", 5432: "postgres", 5900: "vnc", 6379: "redis",
+    27017: "mongodb",
+}
+
+network_limit = int(os.environ.get("NUCLEI_NETWORK_TARGET_LIMIT", "150"))
+network_count = 0
+for host in sorted(hosts, key=lambda item: (-int(item.get("risk_score", 0) or 0), item.get("hostname", ""))):
+    hostname = host.get("hostname", "")
+    current_ips = [ip for ip in host.get("current_ips", []) if ip]
+    ports = []
+    for raw_port in host.get("ports", []):
+        try:
+            ports.append(int(raw_port))
+        except Exception:
+            continue
+
+    for port in ports:
+        if port in web_port_schemes and hostname:
+            scheme = web_port_schemes[port]
+            if port in (80, 443):
+                add_target(f"{scheme}://{hostname}")
+            else:
+                add_target(f"{scheme}://{hostname}:{port}")
+
+    for ip in current_ips:
+        for port in ports:
+            scheme = network_port_schemes.get(port)
+            if not scheme:
+                continue
+            add_target(f"{scheme}://{ip}:{port}")
+            network_count += 1
+            if network_count >= network_limit:
+                break
+        if network_count >= network_limit:
+            break
+    if network_count >= network_limit:
         break
 
 with open(targets_path, "w", encoding="utf-8") as handle:
@@ -565,12 +760,20 @@ with open(targets_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(targets) + "\n")
 PY
 
-if [ -s "$NUCLEI_TARGETS" ]; then
-    if ! run_phase_command "phase3" "Phase 3: Running Nuclei on top 25 risky web targets ..." 35m false \
+if ! config_is_true "$NUCLEI_ENABLED"; then
+    info "Phase 3: Nuclei disabled by configuration."
+    : > "$NUCLEI_OUTPUT"
+    record_phase_result "phase3" "skipped" "disabled by configuration"
+elif ! command -v nuclei >/dev/null 2>&1; then
+    warn "Phase 3: nuclei is not installed; skipping template scan."
+    : > "$NUCLEI_OUTPUT"
+    record_phase_result "phase3" "skipped" "nuclei not installed"
+elif [ -s "$NUCLEI_TARGETS" ]; then
+    if ! run_phase_command "phase3" "Phase 3: Running Nuclei on up to ${NUCLEI_TARGET_LIMIT} web and ${NUCLEI_NETWORK_TARGET_LIMIT} service targets ..." 6h false \
         nuclei -l "$NUCLEI_TARGETS" \
-            -tags misconfig,exposure,takeover,cve,tech,default-login \
-            -severity critical,high,medium \
-            -c 150 -bs 25 -rl 300 -timeout 5 \
+            -tags "$NUCLEI_TAGS" \
+            -severity "$NUCLEI_SEVERITIES" \
+            -c "$NUCLEI_CONCURRENCY" -bs "$NUCLEI_BULK_SIZE" -rl "$NUCLEI_RATE_LIMIT" -timeout "$NUCLEI_TIMEOUT" -retries "$NUCLEI_RETRIES" \
             -jsonl \
             -o "$NUCLEI_OUTPUT" \
             -silent; then
@@ -597,7 +800,7 @@ if config_is_true "${SCREENSHOT_ENABLED:-true}"; then
 
     if [ "$CF_SCANNER_ENABLED" = true ]; then
         # Primary Cloudflare Scan Path with local fallback logic
-python3 - "$RAW_JSON" "$SCREENSHOT_MANIFEST" "$SCREENSHOT_DIR" "${MAX_SCREENSHOTS:-16}" "$CF_ACCOUNT_ID" "${CF_API_TOKEN:-}" "${CF_API_KEY:-}" "${CF_EMAIL:-}" <<'PY'
+python3 - "$RAW_JSON" "$SCREENSHOT_MANIFEST" "$SCREENSHOT_DIR" "${MAX_SCREENSHOTS:-50}" "$CF_ACCOUNT_ID" "${CF_API_TOKEN:-}" "${CF_API_KEY:-}" "${CF_EMAIL:-}" <<'PY'
 import json
 import os
 import subprocess
@@ -753,7 +956,8 @@ if remaining_targets:
             "--input", tmp_json,
             "--output", tmp_manifest,
             "--screenshot-dir", screenshot_dir,
-            "--max-screenshots", str(len(remaining_targets))
+            "--max-screenshots", str(len(remaining_targets)),
+            "--timeout", os.environ.get("SCREENSHOT_TIMEOUT_SECONDS", "90")
         ]
         subprocess.run(fallback_cmd, check=False)
         
@@ -786,12 +990,12 @@ PY
             --input "$RAW_JSON"
             --output "$SCREENSHOT_MANIFEST"
             --screenshot-dir "$SCREENSHOT_DIR"
-            --max-screenshots "${MAX_SCREENSHOTS:-16}"
-            --timeout "${SCREENSHOT_TIMEOUT_SECONDS:-35}"
+            --max-screenshots "${MAX_SCREENSHOTS:-50}"
+            --timeout "${SCREENSHOT_TIMEOUT_SECONDS:-90}"
             --width "${SCREENSHOT_WIDTH:-1440}"
             --height "${SCREENSHOT_HEIGHT:-1024}"
         )
-        if ! run_phase_command "phase4" "Phase 4: Capturing local screenshots ..." 35m true "${screenshot_cmd[@]}"; then
+        if ! run_phase_command "phase4" "Phase 4: Capturing local screenshots ..." 4h true "${screenshot_cmd[@]}"; then
             warn "Local screenshot capture did not complete cleanly."
         fi
     fi
@@ -813,7 +1017,7 @@ render_cmd=(
 if [ -f "$NUCLEI_OUTPUT" ] && [ -s "$NUCLEI_OUTPUT" ]; then
     render_cmd+=(--nuclei "$NUCLEI_OUTPUT")
 fi
-if ! run_phase_command "phase5" "Phase 5: Rendering report ..." 35m false "${render_cmd[@]}"; then
+if ! run_phase_command "phase5" "Phase 5: Rendering report ..." 1h false "${render_cmd[@]}"; then
     warn "Report rendering did not complete cleanly; keeping the fallback HTML output."
 fi
 
