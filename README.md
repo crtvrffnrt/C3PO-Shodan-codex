@@ -115,8 +115,8 @@ chmod +x run.sh bin/run.sh scripts/*.sh install.sh
 ./run.sh example.com
 ```
 
-Interactive terminal runs show a Codex operator model menu before scanning unless a model is supplied by flag or environment variable. The scanner itself does not invoke Codex; the menu only records operator context for agent-driven workflows.
-
+Interactive terminal runs show a Codex operator model menu to choose the lastest model before scanning unless a model is supplied by flag or environment variable. The scanner itself does not invoke Codex; the menu only records operator context for agent-driven workflows.
+Recommondation: Use fast models with medium effort depending on the expected size of the attack surface. 
 Non-interactive and scripted examples:
 
 ```bash
