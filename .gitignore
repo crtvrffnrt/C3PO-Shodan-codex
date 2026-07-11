@@ -10,7 +10,7 @@ attack_surface_latest.html
 *.json
 *.jsonl
 *.html
-!attack_surface_latest.html
+##!attack_surface_latest.html
 *.png
 !example.png
 *.jpeg
