@@ -3,7 +3,7 @@
 
   <h1>C3PO-shodan</h1>
 
-  <p><strong>A Shodan-driven EASM pipeline for mapping exposed infrastructure, enriching risky web targets, and rendering operator-friendly reports.</strong></p>
+  <p><strong>A AI powered and Shodan-driven EASM pipeline for mapping exposed infrastructure, enriching risky web targets, and rendering operator-friendly reports.</strong></p>
 
   <p>
     <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+"></a>
