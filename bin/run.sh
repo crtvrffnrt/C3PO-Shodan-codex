@@ -11,11 +11,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-DEFAULT_CODEX_MODEL="${DEFAULT_CODEX_MODEL:-gpt-5.5}"
-DEFAULT_CODEX_REASONING_EFFORT="${DEFAULT_CODEX_REASONING_EFFORT:-low}"
-DEFAULT_CODEX_FAST_MODE="${DEFAULT_CODEX_FAST_MODE:-true}"
-CODEX_MODEL_OPTIONS=()
-
 source "$PROJECT_ROOT/scripts/common.sh"
 
 config_or_default() {
@@ -59,7 +54,7 @@ and Nuclei follow-up where targets are available.
 Options:
   -d, --domain   Target root domain (supports subdomains like www.example.com)
   --model MODEL  Set Codex operator model context without prompting
-  --effort LEVEL Set Codex reasoning effort context (low, medium, high)
+  --effort LEVEL Set a reasoning effort supported by the selected model
   --fast         Mark Codex operator context as fast mode
   --no-fast      Mark Codex operator context as standard mode
   --no-model-prompt
@@ -71,10 +66,10 @@ Codex model context:
   The scanner itself is deterministic bash/Python and does not invoke Codex.
   In an interactive terminal, run.sh prompts for operator context unless
   C3PO_CODEX_MODEL, CODEX_MODEL, --model, or --no-model-prompt is set.
-  Built-in menu choices cover:
-    gpt-5.5 low default, medium fast / standard
-    gpt-5.4 low / medium / high
-    gpt-5.4-mini low / medium / high
+  Interactive choices are loaded from the local Codex CLI with
+  'codex debug models'. Model and effort values are not built in.
+  Codex discovery is optional; without a usable catalog, scanning continues
+  without model context unless an explicit value can be validated.
 
 Useful environment knobs:
   NUCLEI_TARGET_LIMIT=$NUCLEI_TARGET_LIMIT
@@ -96,6 +91,201 @@ REQUESTED_CODEX_MODEL=""
 REQUESTED_CODEX_EFFORT=""
 REQUESTED_CODEX_FAST_MODE=""
 MODEL_PROMPT_ENABLED="${C3PO_MODEL_PROMPT:-auto}"
+CODEX_CATALOG_FILE=""
+CODEX_CATALOG_STATUS="unloaded"
+CODEX_CATALOG_REASON=""
+CODEX_MODEL_SLUGS=()
+CODEX_MODEL_DISPLAY_NAMES=()
+CODEX_SELECTED_EFFORTS=()
+CODEX_SELECTED_DEFAULT_EFFORT=""
+
+cleanup_codex_catalog() {
+    if [ -n "${CODEX_CATALOG_FILE:-}" ] && [ -f "$CODEX_CATALOG_FILE" ]; then
+        rm -f -- "$CODEX_CATALOG_FILE"
+    fi
+    if [ -n "${CODEX_CATALOG_FILE:-}" ]; then
+        rm -f -- "${CODEX_CATALOG_FILE}.stderr"
+    fi
+}
+
+load_codex_model_catalog() {
+    local stderr_file status
+    if [ "$CODEX_CATALOG_STATUS" != "unloaded" ]; then
+        [ "$CODEX_CATALOG_STATUS" = "loaded" ]
+        return
+    fi
+
+    CODEX_CATALOG_STATUS="failed"
+    if ! command -v codex >/dev/null 2>&1; then
+        CODEX_CATALOG_REASON="codex is not installed or is not on PATH"
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        CODEX_CATALOG_REASON="python3 is unavailable for catalog validation"
+        return 1
+    fi
+    if ! CODEX_CATALOG_FILE="$(mktemp "${TMPDIR:-/tmp}/c3po-codex-models.XXXXXX")"; then
+        CODEX_CATALOG_REASON="could not create a secure temporary catalog file"
+        return 1
+    fi
+    chmod 600 "$CODEX_CATALOG_FILE" 2>/dev/null || true
+    stderr_file="${CODEX_CATALOG_FILE}.stderr"
+    chmod 600 "$stderr_file" 2>/dev/null || true
+    set +e
+    codex debug models >"$CODEX_CATALOG_FILE" 2>"$stderr_file"
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        CODEX_CATALOG_REASON="codex debug models failed with exit code $status"
+        if [ -s "$stderr_file" ]; then
+            CODEX_CATALOG_REASON+=" ($(tr '\n' ' ' <"$stderr_file" | tr -s ' '))"
+        fi
+        rm -f -- "$stderr_file"
+        return 1
+    fi
+    rm -f -- "$stderr_file"
+    if [ ! -s "$CODEX_CATALOG_FILE" ]; then
+        CODEX_CATALOG_REASON="codex debug models returned empty output"
+        return 1
+    fi
+    if ! python3 - "$CODEX_CATALOG_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        catalog = json.load(handle)
+except (OSError, ValueError) as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(catalog, dict) or not isinstance(catalog.get("models"), list):
+    raise SystemExit(1)
+PY
+    then
+        CODEX_CATALOG_REASON="codex debug models returned malformed JSON or no .models array"
+        return 1
+    fi
+    CODEX_CATALOG_STATUS="loaded"
+    trap cleanup_codex_catalog EXIT
+    return 0
+}
+
+load_codex_models() {
+    local record
+    CODEX_MODEL_SLUGS=()
+    CODEX_MODEL_DISPLAY_NAMES=()
+    while IFS=$'\t' read -r record; do
+        CODEX_MODEL_SLUGS+=("${record%%$'\t'*}")
+        record="${record#*$'\t'}"
+        CODEX_MODEL_DISPLAY_NAMES+=("$record")
+    done < <(python3 - "$CODEX_CATALOG_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    catalog = json.load(handle)
+for model in catalog.get("models", []):
+    if not isinstance(model, dict):
+        continue
+    slug = model.get("slug")
+    if not isinstance(slug, str) or not slug or any(ord(char) < 32 for char in slug):
+        continue
+    display = model.get("display_name")
+    if not isinstance(display, str) or not display:
+        display = slug
+    display = " ".join(display.split())
+    print(f"{slug}\t{display}")
+PY
+)
+    [ "${#CODEX_MODEL_SLUGS[@]}" -gt 0 ]
+}
+
+find_codex_model() {
+    local wanted="$1"
+    local index
+    for index in "${!CODEX_MODEL_SLUGS[@]}"; do
+        if [ "${CODEX_MODEL_SLUGS[$index]}" = "$wanted" ]; then
+            printf '%s' "$index"
+            return 0
+        fi
+    done
+    return 1
+}
+
+list_model_reasoning_efforts() {
+    local model_slug="$1"
+    CODEX_SELECTED_EFFORTS=()
+    CODEX_SELECTED_DEFAULT_EFFORT=""
+    while IFS= read -r record; do
+        CODEX_SELECTED_EFFORTS+=("$record")
+    done < <(python3 - "$CODEX_CATALOG_FILE" "$model_slug" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    catalog = json.load(handle)
+for model in catalog.get("models", []):
+    if isinstance(model, dict) and model.get("slug") == sys.argv[2]:
+        default = model.get("default_reasoning_level")
+        if isinstance(default, str):
+            print(f"__DEFAULT__{default}")
+        levels = model.get("supported_reasoning_levels")
+        if isinstance(levels, list):
+            for level in levels:
+                if isinstance(level, dict) and isinstance(level.get("effort"), str) and level["effort"]:
+                    print(level["effort"])
+        break
+PY
+)
+    if [ "${#CODEX_SELECTED_EFFORTS[@]}" -gt 0 ]; then
+        local effort
+        for effort in "${CODEX_SELECTED_EFFORTS[@]}"; do
+            case "$effort" in
+                __DEFAULT__*) CODEX_SELECTED_DEFAULT_EFFORT="${effort#__DEFAULT__}"; break ;;
+            esac
+        done
+        local filtered=()
+        for effort in "${CODEX_SELECTED_EFFORTS[@]}"; do
+            case "$effort" in __DEFAULT__*) ;; *) filtered+=("$effort");; esac
+        done
+        if [ "${#filtered[@]}" -gt 0 ]; then
+            CODEX_SELECTED_EFFORTS=("${filtered[@]}")
+        else
+            CODEX_SELECTED_EFFORTS=()
+        fi
+    fi
+}
+
+validate_codex_model() {
+    local model="$1"
+    if find_codex_model "$model" >/dev/null; then
+        return 0
+    fi
+    error "Codex model '$model' is not present in the current catalog."
+    printf '%s\n' "Available model slugs:"
+    printf '  %s\n' "${CODEX_MODEL_SLUGS[@]}"
+    return 1
+}
+
+validate_codex_effort() {
+    local model="$1" effort="$2" candidate
+    list_model_reasoning_efforts "$model"
+    if [ "${#CODEX_SELECTED_EFFORTS[@]}" -eq 0 ]; then
+        warn "The catalog does not list supported efforts for '$model'; cannot validate '$effort'."
+        return 0
+    fi
+    for candidate in "${CODEX_SELECTED_EFFORTS[@]}"; do
+        if [ "$candidate" = "$effort" ]; then
+            return 0
+        fi
+    done
+    error "Reasoning effort '$effort' is not supported by Codex model '$model'."
+    printf '%s\n' "Supported efforts for $model:"
+    printf '  %s\n' "${CODEX_SELECTED_EFFORTS[@]}"
+    return 1
+}
 
 # Regex for domain validation (supports subdomains)
 DOMAIN_REGEX="^([a-zA-Z0-9](([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})$"
@@ -146,6 +336,7 @@ fatal() {
 }
 
 configure_codex_context() {
+    local current effort catalog_needed=false
     if [ -n "$REQUESTED_CODEX_MODEL" ]; then
         export C3PO_CODEX_MODEL="$REQUESTED_CODEX_MODEL"
         export CODEX_MODEL="$REQUESTED_CODEX_MODEL"
@@ -157,23 +348,50 @@ configure_codex_context() {
         export C3PO_CODEX_FAST_MODE="$REQUESTED_CODEX_FAST_MODE"
     fi
 
-    local current="${C3PO_CODEX_MODEL:-${CODEX_MODEL:-}}"
-    if [ -z "$current" ] && [ "$MODEL_PROMPT_ENABLED" != "never" ] && [ "$MODEL_PROMPT_ENABLED" != "false" ] && [ -t 0 ] && [ -t 1 ]; then
-        prompt_codex_context
-        current="${C3PO_CODEX_MODEL:-${CODEX_MODEL:-}}"
+    current="${C3PO_CODEX_MODEL:-${CODEX_MODEL:-}}"
+    if [ -n "$current" ] || [ -n "${C3PO_CODEX_REASONING_EFFORT:-}" ] || [ -n "$REQUESTED_CODEX_EFFORT" ]; then
+        catalog_needed=true
     fi
-    if [ -z "$current" ] && [ -n "${DEFAULT_CODEX_MODEL:-}" ]; then
-        export C3PO_CODEX_MODEL="$DEFAULT_CODEX_MODEL"
-        export CODEX_MODEL="$DEFAULT_CODEX_MODEL"
-        export C3PO_CODEX_REASONING_EFFORT="${C3PO_CODEX_REASONING_EFFORT:-$DEFAULT_CODEX_REASONING_EFFORT}"
-        export C3PO_CODEX_FAST_MODE="${C3PO_CODEX_FAST_MODE:-$DEFAULT_CODEX_FAST_MODE}"
-        current="$DEFAULT_CODEX_MODEL"
+    if [ -z "$current" ] && [ "$MODEL_PROMPT_ENABLED" != "never" ] && [ "$MODEL_PROMPT_ENABLED" != "false" ] && [ -t 0 ] && [ -t 1 ]; then
+        catalog_needed=true
+    fi
+
+    if [ "$catalog_needed" = true ] && ! load_codex_model_catalog; then
+        warn "Codex model discovery unavailable: $CODEX_CATALOG_REASON. Continuing without catalog validation."
+    fi
+    if [ "$CODEX_CATALOG_STATUS" = "loaded" ]; then
+        if ! load_codex_models; then
+            if [ -n "$current" ]; then
+                error "Codex model catalog contains no usable model slugs; cannot validate '$current'."
+                return 1
+            fi
+            warn "Codex model catalog contains no usable model slugs. Continuing without model context."
+        fi
+    fi
+
+    if [ -n "$current" ] && [ "$CODEX_CATALOG_STATUS" = "loaded" ]; then
+        validate_codex_model "$current" || return 1
+        if [ -n "${C3PO_CODEX_REASONING_EFFORT:-}" ]; then
+            validate_codex_effort "$current" "$C3PO_CODEX_REASONING_EFFORT" || return 1
+        fi
+    elif [ -n "$current" ]; then
+        warn "Codex model '$current' could not be validated because the catalog is unavailable."
+    fi
+
+    if [ -z "$current" ] && [ "$MODEL_PROMPT_ENABLED" != "never" ] && [ "$MODEL_PROMPT_ENABLED" != "false" ] && [ -t 0 ] && [ -t 1 ]; then
+        if [ "$CODEX_CATALOG_STATUS" = "loaded" ] && [ "${#CODEX_MODEL_SLUGS[@]}" -gt 0 ]; then
+            prompt_codex_context || return 1
+            current="${C3PO_CODEX_MODEL:-${CODEX_MODEL:-}}"
+        else
+            warn "No usable Codex catalog is available; continuing without model context."
+        fi
     fi
 
     if [ -n "$current" ]; then
         export C3PO_CODEX_MODEL="$current"
         export CODEX_MODEL="$current"
-        info "Codex model context: model=$C3PO_CODEX_MODEL effort=${C3PO_CODEX_REASONING_EFFORT:-unset} fast=${C3PO_CODEX_FAST_MODE:-unset}"
+        effort="${C3PO_CODEX_REASONING_EFFORT:-unset}"
+        info "Codex model context: model=$C3PO_CODEX_MODEL effort=$effort fast=${C3PO_CODEX_FAST_MODE:-unset}"
     else
         info "Codex operator context enabled; deterministic scanner does not invoke Codex as a subprocess."
     fi
@@ -182,58 +400,100 @@ configure_codex_context() {
 apply_codex_choice() {
     local model="$1"
     local effort="$2"
-    local fast_mode="$3"
     export C3PO_CODEX_MODEL="$model"
     export CODEX_MODEL="$model"
-    export C3PO_CODEX_REASONING_EFFORT="$effort"
-    export C3PO_CODEX_FAST_MODE="$fast_mode"
+    if [ -n "$effort" ]; then
+        export C3PO_CODEX_REASONING_EFFORT="$effort"
+    else
+        unset C3PO_CODEX_REASONING_EFFORT
+    fi
 }
 
 prompt_codex_context() {
-    local choice custom_model custom_effort custom_fast
+    local choice model_index model effort choice_index
     echo
     info "Choose Codex operator model context (scanner does not invoke Codex):"
-    cat <<'EOF'
-  1) gpt-5.5 | effort low    | fast mode (default)
-  2) gpt-5.5 | effort medium | fast mode
-  3) gpt-5.5 | effort medium | standard mode
-  4) gpt-5.4 | effort high   | standard mode
-  5) gpt-5.4 | effort medium | standard mode
-  6) gpt-5.4 | effort low    | fast mode
-  7) gpt-5.4-mini | effort high   | standard mode
-  8) gpt-5.4-mini | effort medium | fast mode
-  9) gpt-5.4-mini | effort low    | fast mode
-  c) Custom model context
-  0) Continue without model context
-EOF
-    read -r -p "Selection [1]: " choice
-    choice="${choice:-1}"
-    case "$choice" in
-        1) apply_codex_choice "gpt-5.5" "low" "true" ;;
-        2) apply_codex_choice "gpt-5.5" "medium" "true" ;;
-        3) apply_codex_choice "gpt-5.5" "medium" "false" ;;
-        4) apply_codex_choice "gpt-5.4" "high" "false" ;;
-        5) apply_codex_choice "gpt-5.4" "medium" "false" ;;
-        6) apply_codex_choice "gpt-5.4" "low" "true" ;;
-        7) apply_codex_choice "gpt-5.4-mini" "high" "false" ;;
-        8) apply_codex_choice "gpt-5.4-mini" "medium" "true" ;;
-        9) apply_codex_choice "gpt-5.4-mini" "low" "true" ;;
-        c|C)
-            read -r -p "Model name: " custom_model
-            read -r -p "Reasoning effort [medium]: " custom_effort
-            read -r -p "Fast mode? [y/N]: " custom_fast
-            custom_effort="${custom_effort:-medium}"
-            case "$(printf '%s' "$custom_fast" | tr '[:upper:]' '[:lower:]')" in
-                y|yes|true|1) custom_fast="true" ;;
-                *) custom_fast="false" ;;
-            esac
-            if [ -n "$custom_model" ]; then
-                apply_codex_choice "$custom_model" "$custom_effort" "$custom_fast"
+    printf '%s\n' "Available models:"
+    for model_index in "${!CODEX_MODEL_SLUGS[@]}"; do
+        model="${CODEX_MODEL_SLUGS[$model_index]}"
+        if [ "${CODEX_MODEL_DISPLAY_NAMES[$model_index]}" = "$model" ]; then
+            printf '  %d) %s\n' "$((model_index + 1))" "$model"
+        else
+            printf '  %d) %s (%s)\n' "$((model_index + 1))" "${CODEX_MODEL_DISPLAY_NAMES[$model_index]}" "$model"
+        fi
+    done
+    printf '%s\n' "  0) Continue without model context"
+    while true; do
+        if ! read -r -p "Model selection: " choice; then
+            warn "Model selection cancelled; continuing without model context."
+            return 0
+        fi
+        if [ "$choice" = "0" ] || [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
+            info "Continuing without model context."
+            return 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#CODEX_MODEL_SLUGS[@]}" ]; then
+            model_index=$((choice - 1))
+            model="${CODEX_MODEL_SLUGS[$model_index]}"
+            break
+        fi
+        warn "Invalid model selection '$choice'. Enter a number from 1 to ${#CODEX_MODEL_SLUGS[@]}, or 0 to continue without model context."
+    done
+
+    export C3PO_CODEX_MODEL="$model"
+    export CODEX_MODEL="$model"
+    info "Selected model: $model"
+    list_model_reasoning_efforts "$model"
+    if [ -n "${C3PO_CODEX_REASONING_EFFORT:-}" ]; then
+        validate_codex_effort "$model" "$C3PO_CODEX_REASONING_EFFORT" || return 1
+        info "Using preconfigured reasoning effort: $C3PO_CODEX_REASONING_EFFORT"
+        return 0
+    fi
+    if [ "${#CODEX_SELECTED_EFFORTS[@]}" -eq 0 ]; then
+        if [ -n "$CODEX_SELECTED_DEFAULT_EFFORT" ]; then
+            info "No supported reasoning-level list was provided; using catalog default '$CODEX_SELECTED_DEFAULT_EFFORT'."
+            export C3PO_CODEX_REASONING_EFFORT="$CODEX_SELECTED_DEFAULT_EFFORT"
+        else
+            warn "This model has no supported reasoning-level list or default; leaving effort unset."
+            unset C3PO_CODEX_REASONING_EFFORT
+        fi
+        return 0
+    fi
+
+    printf '%s\n' "Supported reasoning efforts:"
+    for model_index in "${!CODEX_SELECTED_EFFORTS[@]}"; do
+        effort="${CODEX_SELECTED_EFFORTS[$model_index]}"
+        if [ "$effort" = "$CODEX_SELECTED_DEFAULT_EFFORT" ]; then
+            printf '  %d) %s [default]\n' "$((model_index + 1))" "$effort"
+        else
+            printf '  %d) %s\n' "$((model_index + 1))" "$effort"
+        fi
+    done
+    while true; do
+        if [ -n "$CODEX_SELECTED_DEFAULT_EFFORT" ]; then
+            read -r -p "Effort selection (Enter for $CODEX_SELECTED_DEFAULT_EFFORT): " choice || {
+                warn "Effort selection cancelled; leaving effort unset."
+                unset C3PO_CODEX_REASONING_EFFORT
+                return 0
+            }
+            if [ -z "$choice" ]; then
+                export C3PO_CODEX_REASONING_EFFORT="$CODEX_SELECTED_DEFAULT_EFFORT"
+                return 0
             fi
-            ;;
-        0) DEFAULT_CODEX_MODEL="" ;;
-        *) warn "Unknown model selection '$choice'; continuing without model context." ;;
-    esac
+        else
+            read -r -p "Effort selection: " choice || {
+                warn "Effort selection cancelled; leaving effort unset."
+                unset C3PO_CODEX_REASONING_EFFORT
+                return 0
+            }
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#CODEX_SELECTED_EFFORTS[@]}" ]; then
+            choice_index=$((choice - 1))
+            export C3PO_CODEX_REASONING_EFFORT="${CODEX_SELECTED_EFFORTS[$choice_index]}"
+            return 0
+        fi
+        warn "Invalid effort selection '$choice'. Enter a number from 1 to ${#CODEX_SELECTED_EFFORTS[@]}."
+    done
 }
 
 record_phase_result() {
@@ -474,15 +734,27 @@ PY
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d|--domain)
+            if [ "$#" -lt 2 ]; then
+                error "$1 requires a value."
+                exit 1
+            fi
             TARGET_INPUT="${2:-}"
             shift 2
             ;;
         --model|--codex-model)
+            if [ "$#" -lt 2 ]; then
+                error "$1 requires a value."
+                exit 1
+            fi
             REQUESTED_CODEX_MODEL="${2:-}"
             MODEL_PROMPT_ENABLED="never"
             shift 2
             ;;
         --effort|--reasoning-effort)
+            if [ "$#" -lt 2 ]; then
+                error "$1 requires a value."
+                exit 1
+            fi
             REQUESTED_CODEX_EFFORT="${2:-}"
             shift 2
             ;;

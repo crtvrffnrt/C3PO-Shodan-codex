@@ -115,14 +115,22 @@ chmod +x run.sh bin/run.sh scripts/*.sh install.sh
 ./run.sh example.com
 ```
 
-Interactive terminal runs show a Codex operator model menu to choose the lastest model before scanning unless a model is supplied by flag or environment variable. The scanner itself does not invoke Codex; the menu only records operator context for agent-driven workflows.
-Recommondation: Use fast models with medium effort depending on the expected size of the attack surface. 
+Interactive terminal runs discover the available Codex models with `codex debug models`, then show a model menu followed by an effort menu for the selected model. The displayed catalog depends on the installed Codex CLI version and account availability. The scanner itself does not invoke Codex; this only records optional operator context for agent-driven workflows.
 Non-interactive and scripted examples:
 
 ```bash
 ./run.sh example.com --no-model-prompt
-./run.sh example.com --model gpt-5.5 --effort low --fast
-./run.sh --domain example.com --model gpt-5.4-mini --effort high --no-fast
+./run.sh example.com --model <model-slug> --effort <supported-effort> --fast
+./run.sh --domain example.com --model <model-slug> --effort <supported-effort> --no-fast
+```
+
+The model and effort placeholders must be values in the local catalog. Explicit CLI arguments and `C3PO_CODEX_MODEL`, `CODEX_MODEL`, and `C3PO_CODEX_REASONING_EFFORT` environment values take precedence over interactive prompts. Use `--no-model-prompt` or `C3PO_MODEL_PROMPT=never` for CI and scheduled runs. Codex is optional: if it is unavailable, its catalog command fails, or execution is noninteractive, the deterministic scanner continues without prompting; explicit values are validated when a catalog can be loaded, and otherwise a warning explains that validation was unavailable. Fast mode is independent operator context, controlled only by `--fast`, `--no-fast`, or `C3PO_CODEX_FAST_MODE`; it is not inferred from a model name or reasoning effort.
+
+To inspect the raw catalog manually:
+
+```bash
+codex debug models | jq
+codex debug models | jq -r '.models[].slug'
 ```
 
 ## Pipeline & Execution Flow
@@ -174,25 +182,11 @@ While the pipeline execution is structured and deterministic to preserve reprodu
 2. **Context Enrichment**: Shell scripts (like [scripts/fetch-context.sh](file:///tmp/C3PO-Shodan-codex/scripts/fetch-context.sh)) keep track of active rules, making the entire workspace navigable and controllable by LLM operators using Codex-style commands.
 3. **Runtime Dependency**: Codex is not invoked by `run.sh`; `C3PO_CODEX_MODEL`, `CODEX_MODEL`, `C3PO_CODEX_REASONING_EFFORT`, and `C3PO_CODEX_FAST_MODE` are optional operator-context variables only.
 
-### Codex Model Menu
+### Codex Operator Context
 
-When stdin/stdout are interactive and no model is preconfigured, `run.sh` prompts for:
+The model menu preserves the catalog order and shows each model's display name and slug, using the slug alone when no display name is supplied. This implementation does not infer a preferred model, so an explicit model choice is required. After model selection, only that model's non-empty `supported_reasoning_levels[].effort` values are shown. The catalog's `default_reasoning_level` is marked and selected by Enter when it is present and supported. Unknown future effort names work without a code update. If no supported effort list exists, the catalog default is used when present; otherwise effort remains unset.
 
-| Menu Choice | Model | Effort | Fast Mode |
-| --- | --- | --- | --- |
-| 1 | `gpt-5.5` | `low` | `true` |
-| 2 | `gpt-5.5` | `medium` | `true` |
-| 3 | `gpt-5.5` | `medium` | `false` |
-| 4 | `gpt-5.4` | `high` | `false` |
-| 5 | `gpt-5.4` | `medium` | `false` |
-| 6 | `gpt-5.4` | `low` | `true` |
-| 7 | `gpt-5.4-mini` | `high` | `false` |
-| 8 | `gpt-5.4-mini` | `medium` | `true` |
-| 9 | `gpt-5.4-mini` | `low` | `true` |
-| c | custom | custom | custom |
-| 0 | unset | unset | unset |
-
-Use `--no-model-prompt` or `C3PO_MODEL_PROMPT=never` for CI and scheduled runs.
+The catalog is loaded once per run and malformed, empty, or unusable responses produce actionable warnings. A failed discovery does not make Codex a runtime requirement and does not alter the deterministic Shodan, Nuclei, screenshot, or reporting pipeline.
 
 ## Configuration
 
